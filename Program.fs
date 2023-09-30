@@ -1,5 +1,5 @@
 ﻿open System
-open BenchmarkDotNet
+open System.Threading.Tasks
 open BenchmarkDotNet.Attributes
 open Npgsql
 open Testcontainers.PostgreSql
@@ -10,11 +10,14 @@ type CopyVsInsertUnnestComparison() =
 
     let data: ResizeArray<int * string * DateTime> = ResizeArray<_>()
 
-    [<Params(1, 10, 100, 1000, 10000, 100000)>]
+    [<Params(1000, 10000, 100000)>]
     member val Insertions = 0 with get, set
 
-    [<Params("14.9", "15.4", "16.0")>]
+    [<Params("15.4", "16.0")>]
     member val PostgresVersion = Unchecked.defaultof<_> with get, set
+
+    [<Params(1, 2, 4, 6)>]
+    member val Parallelism = Unchecked.defaultof<_> with get, set
 
     [<GlobalSetup>]
     member this.GlobalSetup() =
@@ -52,55 +55,67 @@ type CopyVsInsertUnnestComparison() =
 
     [<Benchmark>]
     member this.InsertUnnest() =
-        task {
-            use command =
-                dataSource.CreateCommand
-                    """
-                INSERT INTO insertion_table (id, name, date)
-                SELECT id, name, date
-                FROM unnest(@ids, @names, @dates) AS t(id, name, date)
-                """
+        Task.WhenAll(
+            seq {
+                for _ in 1 .. this.Parallelism do
+                    task {
+                        use command =
+                            dataSource.CreateCommand
+                                """
+                        INSERT INTO insertion_table (id, name, date)
+                        SELECT id, name, date
+                        FROM unnest(@ids, @names, @dates) AS t(id, name, date)
+                        """
 
-            command.Parameters.Add(NpgsqlParameter<int[]>("ids", data |> Seq.map (fun (i, _, _) -> i) |> Seq.toArray))
-            |> ignore
+                        command.Parameters.Add(
+                            NpgsqlParameter<int[]>("ids", data |> Seq.map (fun (i, _, _) -> i) |> Seq.toArray)
+                        )
+                        |> ignore
 
-            command.Parameters.Add(
-                NpgsqlParameter<string[]>("names", data |> Seq.map (fun (_, n, _) -> n) |> Seq.toArray)
-            )
-            |> ignore
+                        command.Parameters.Add(
+                            NpgsqlParameter<string[]>("names", data |> Seq.map (fun (_, n, _) -> n) |> Seq.toArray)
+                        )
+                        |> ignore
 
-            command.Parameters.Add(
-                NpgsqlParameter<DateTime[]>("dates", data |> Seq.map (fun (_, _, d) -> d) |> Seq.toArray)
-            )
-            |> ignore
+                        command.Parameters.Add(
+                            NpgsqlParameter<DateTime[]>("dates", data |> Seq.map (fun (_, _, d) -> d) |> Seq.toArray)
+                        )
+                        |> ignore
 
-            let! _ = command.ExecuteNonQueryAsync()
-            return ()
-        }
+                        let! _ = command.ExecuteNonQueryAsync()
+                        return ()
+                    }
+            }
+        )
 
 
     [<Benchmark>]
     member this.Copy() =
-        task {
-            use connection = dataSource.CreateConnection()
-            do! connection.OpenAsync()
+        Task.WhenAll(
+            seq {
+                for _ in 1 .. this.Parallelism do
+                    task {
+                        use connection = dataSource.CreateConnection()
+                        do! connection.OpenAsync()
 
-            let! importer =
-                connection.BeginBinaryImportAsync
+                        let! importer =
+                            connection.BeginBinaryImportAsync
+                                """
+                    COPY insertion_table (id, name, date)
+                    FROM STDIN (FORMAT BINARY)
                     """
-                COPY insertion_table (id, name, date)
-                FROM STDIN (FORMAT BINARY)
-                """
 
-            for i, n, d in data do
-                do! importer.StartRowAsync()
-                do! importer.WriteAsync i
-                do! importer.WriteAsync n
-                do! importer.WriteAsync d
+                        for i, n, d in data do
+                            do! importer.StartRowAsync()
+                            do! importer.WriteAsync i
+                            do! importer.WriteAsync n
+                            do! importer.WriteAsync d
 
-            let! _ = importer.CompleteAsync()
-            return ()
-        }
+                        let! _ = importer.CompleteAsync()
+                        return ()
+                    }
+            }
+        )
 
 [<EntryPoint>]
 let main argv =
